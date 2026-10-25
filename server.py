@@ -28,11 +28,6 @@ def get_current_directory() -> str:
     return os.getcwd()
 
 
-if __name__ == "__main__":
-    mcp.run(transport="stdio")
-
-
-
 @mcp.resource("project://info")
 def get_project_info() -> str:
     """Provide basic information about the Learning MCP project."""
@@ -51,3 +46,44 @@ def get_project_info() -> str:
     This project demonstrates MCP tools, resources,
     and integration with a local language model.
     """
+
+
+@mcp.resource("project://instructions")
+def get_project_instructions() -> str:
+    """Provide instructions for using the Learning MCP project."""
+    return """
+    How to use Learning MCP:
+    1. Activate the Python virtual environment.
+    2. Make sure Ollama is running.
+    3. Run python client.py.
+    4. Enter a question in the terminal.
+    5. Type exit to stop the application.
+    """
+
+
+@mcp.resource("project://configuration")
+def get_project_configuration() -> str:
+    """Provide the current Learning MCP project configuration."""
+    return """
+    Project configuration:
+    Language: Python
+    MCP transport: STDIO
+    LLM runtime: Ollama
+    Model: qwen3:8b
+    Maximum tool-call rounds: 5
+    """
+
+
+@mcp.prompt()
+def explain_project(topic: str) -> str:
+    """Create a reusable prompt for explaining a project topic."""
+    return (
+        f"Explain the following topic in the context of the "
+        f"Learning MCP project: {topic}. "
+        "Use simple language, explain the technical details, "
+        "and provide a practical example."
+    )
+
+
+if __name__ == "__main__":
+    mcp.run(transport="stdio")

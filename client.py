@@ -29,6 +29,19 @@ def get_tool_text(result) -> str:
     return text or "Tool returned no text content."
 
 
+async def read_mcp_resource(mcp_client, uri: str) -> str:
+    """Read a text resource through the MCP client."""
+    result = await mcp_client.read_resource(uri)
+
+    parts = []
+
+    for item in result.contents:
+        if hasattr(item, "text") and item.text:
+            parts.append(item.text)
+
+    return "\n".join(parts) or "Resource returned no text content."
+
+
 async def main():
     server_path = Path(__file__).with_name("server.py")
 
@@ -43,10 +56,14 @@ async def main():
         {
             "role": "system",
             "content": (
-                "You are a helpful assistant. Use the available tools "
-                "when needed. Use the supplied resource information "
-                "when relevant. Never claim a tool succeeded unless "
-                "its result confirms success."
+                "You are a helpful assistant connected to an MCP server. "
+                "Use available MCP tools when appropriate. "
+                "Use the read_mcp_resource function when you need "
+                "information from an MCP resource. Only request resource "
+                "URIs listed in the available resources. "
+                "Use tool and resource results accurately. "
+                "Never claim an operation succeeded unless its result "
+                "confirms success."
             ),
         }
     ]
@@ -54,15 +71,17 @@ async def main():
     print(f"Connecting to MCP server and Ollama model {MODEL}...")
 
     async with Client(server_params) as mcp_client:
+
         # --------------------------------------------------
         # 1. Discover MCP tools
         # --------------------------------------------------
         mcp_result = await mcp_client.list_tools()
+
         mcp_tools = {
             tool.name: tool for tool in mcp_result.tools
         }
 
-        print("\nAvailable tools:")
+        print("\nAvailable MCP tools:")
         for tool in mcp_result.tools:
             print(f"- {tool.name}: {tool.description or 'No description'}")
 
@@ -71,47 +90,52 @@ async def main():
         # --------------------------------------------------
         resource_result = await mcp_client.list_resources()
 
-        print("\nAvailable resources:")
-        for resource in resource_result.resources:
-            print(f"- {resource.name}: {resource.uri}")
-
-        # --------------------------------------------------
-        # 3. Read the project information resource
-        # --------------------------------------------------
-        resource_uri = "project://info"
-
-        available_uris = {
-            str(resource.uri)
+        resources_by_uri = {
+            str(resource.uri): resource
             for resource in resource_result.resources
         }
 
-        if resource_uri in available_uris:
-            resource_content = await mcp_client.read_resource(
-                resource_uri
+        resource_uris = list(resources_by_uri.keys())
+
+        print("\nAvailable MCP resources:")
+        for uri, resource in resources_by_uri.items():
+            print(f"- {uri}: {resource.name}")
+
+        if resources_by_uri:
+            resource_descriptions = "\n".join(
+                f"- URI: {uri}; "
+                f"Name: {resource.name}; "
+                f"Description: {resource.description or 'Not provided'}"
+                for uri, resource in resources_by_uri.items()
             )
 
-            resource_parts = []
-
-            for item in resource_content.contents:
-                if hasattr(item, "text") and item.text:
-                    resource_parts.append(item.text)
-
-            resource_text = "\n".join(resource_parts)
-
-            print("\nProject resource content:")
-            print(resource_text or "Resource returned no text content.")
-
-            # Add resource information to the LLM's context.
-            if resource_text:
-                messages[0]["content"] += (
-                    "\n\nProject information from the MCP resource "
-                    f"{resource_uri}:\n{resource_text}"
-                )
-        else:
-            print(f"\nResource {resource_uri} was not found.")
+            messages[0]["content"] += (
+                "\n\nAvailable MCP resources:\n"
+                + resource_descriptions
+                + "\nUse a resource when its content is relevant."
+            )
 
         # --------------------------------------------------
-        # 4. Convert MCP tools to Ollama's tool format
+        # 3. Discover MCP prompts
+        # --------------------------------------------------
+        prompt_result = await mcp_client.list_prompts()
+
+        prompts_by_name = {
+            prompt.name: prompt
+            for prompt in prompt_result.prompts
+        }
+        print("\nDEBUG - Prompts returned by server:")
+
+        for prompt in prompt_result.prompts:
+            print(f"Name: {prompt.name}")
+            print(f"Description: {prompt.description}")
+
+        print("\nAvailable MCP prompts:")
+        for prompt in prompt_result.prompts:
+            print(f"- {prompt.name}: {prompt.description or 'No description'}")
+
+        # --------------------------------------------------
+        # 4. Convert MCP tools into Ollama tool definitions
         # --------------------------------------------------
         ollama_tools = [
             {
@@ -125,12 +149,43 @@ async def main():
             for tool in mcp_result.tools
         ]
 
+        # --------------------------------------------------
+        # 5. Add a client-side resource-reading function
+        # --------------------------------------------------
+        if resource_uris:
+            ollama_tools.append({
+                "type": "function",
+                "function": {
+                    "name": "read_mcp_resource",
+                    "description": (
+                        "Read an available MCP resource when you need "
+                        "its contents to answer the user's question."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "uri": {
+                                "type": "string",
+                                "enum": resource_uris,
+                                "description": "URI of the resource to read.",
+                            }
+                        },
+                        "required": ["uri"],
+                    },
+                },
+            })
+
         print("\nConnected successfully!")
-        print("Available tools:", ", ".join(mcp_tools))
-        print("\nType 'exit' to quit.\n")
+        print("Type a question to chat.")
+        print("Commands:")
+        print("  /resources              - List available resources")
+        print("  /prompts                - List available prompts")
+        print("  /prompt resources       - Run explain_project with topic=resources")
+        print("  /prompt <topic>         - Run explain_project for another topic")
+        print("  exit                    - Quit\n")
 
         # --------------------------------------------------
-        # 5. Interactive chat and tool-calling loop
+        # 6. Interactive chat loop
         # --------------------------------------------------
         while True:
             user_input = input("You: ").strip()
@@ -141,11 +196,99 @@ async def main():
             if not user_input:
                 continue
 
+            # List resources on demand.
+            if user_input == "/resources":
+                for uri, resource in resources_by_uri.items():
+                    print(f"- {uri}: {resource.name}")
+                print()
+                continue
+
+            # List prompts on demand.
+            if user_input == "/prompts":
+                for prompt in prompts_by_name.values():
+                    print(f"- {prompt.name}: {prompt.description or 'No description'}")
+                print()
+                continue
+
+            # Retrieve an MCP prompt and send its messages to Ollama.
+            if user_input.startswith("/prompt "):
+                topic = user_input[len("/prompt "):].strip()
+
+                if not topic:
+                    print("Please provide a topic, e.g. /prompt resources\n")
+                    continue
+
+                if "explain_project" not in prompts_by_name:
+                    print("The MCP prompt 'explain_project' is not available.\n")
+                    continue
+
+                try:
+                    prompt_response = await mcp_client.get_prompt(
+                        "explain_project",
+                        arguments={"topic": topic},
+                    )
+
+                    # Convert returned MCP prompt messages into Ollama messages.
+                    prompt_messages = []
+
+                    for prompt_message in prompt_response.messages:
+                        content = prompt_message.content
+
+                        if isinstance(content, TextContent):
+                            prompt_text = content.text
+                        elif hasattr(content, "text"):
+                            prompt_text = content.text
+                        else:
+                            prompt_text = str(content)
+
+                        role = getattr(prompt_message, "role", "user")
+
+                        # Map MCP prompt roles to Ollama chat roles.
+                        if role not in {"user", "assistant", "system"}:
+                            role = "user"
+
+                        prompt_messages.append({
+                            "role": role,
+                            "content": prompt_text,
+                        })
+
+                    if not prompt_messages:
+                        print("The MCP prompt returned no messages.\n")
+                        continue
+
+                    print(f"\nRetrieved MCP prompt: explain_project ({topic})")
+
+                    prompt_chat = [
+                        messages[0],
+                        *prompt_messages,
+                    ]
+
+                    response = await ollama.chat(
+                        model=MODEL,
+                        messages=prompt_chat,
+                        think=False,
+                        options={"temperature": 0},
+                    )
+
+                    print(f"\nAssistant: {response.message.content}\n")
+
+                except Exception as exc:
+                    print(
+                        f"Prompt request failed: "
+                        f"{type(exc).__name__}: {exc}\n"
+                    )
+
+                continue
+
+            # Add a normal user message to the ongoing conversation.
             messages.append({
                 "role": "user",
                 "content": user_input,
             })
 
+            # --------------------------------------------------
+            # 7. LLM tool/resource calling loop
+            # --------------------------------------------------
             for _ in range(MAX_TOOL_ROUNDS):
                 response = await ollama.chat(
                     model=MODEL,
@@ -160,41 +303,62 @@ async def main():
 
                 tool_calls = assistant_message.tool_calls or []
 
-                # The model has produced its final answer.
+                # The model produced a final answer.
                 if not tool_calls:
-                    print(
-                        f"\nAssistant: {assistant_message.content}\n"
-                    )
+                    print(f"\nAssistant: {assistant_message.content}\n")
                     break
 
-                # Execute each tool requested by the model.
+                # Execute each requested function.
                 for tool_call in tool_calls:
                     name = tool_call.function.name
                     arguments = tool_call.function.arguments
 
-                    print(f"\nCalling MCP tool: {name}")
-                    print(f"Arguments: {arguments}")
+                    # Handle client-side resource reading.
+                    if name == "read_mcp_resource":
+                        uri = arguments.get("uri", "")
 
-                    if name not in mcp_tools:
-                        tool_output = (
-                            f"Error: Unknown tool '{name}'."
-                        )
-                    else:
+                        print(f"\nReading MCP resource: {uri}")
+
+                        if uri not in resources_by_uri:
+                            tool_output = (
+                                f"Error: Resource URI '{uri}' "
+                                "is not available."
+                            )
+                        else:
+                            try:
+                                tool_output = await read_mcp_resource(
+                                    mcp_client,
+                                    uri,
+                                )
+                            except Exception as exc:
+                                tool_output = (
+                                    f"Resource read failed: "
+                                    f"{type(exc).__name__}: {exc}"
+                                )
+
+                    # Handle actual MCP server tools.
+                    elif name in mcp_tools:
+                        print(f"\nCalling MCP tool: {name}")
+                        print(f"Arguments: {arguments}")
+
                         try:
                             result = await mcp_client.call_tool(
                                 name,
                                 arguments,
                             )
                             tool_output = get_tool_text(result)
-
                         except Exception as exc:
                             tool_output = (
                                 f"Tool call failed: "
                                 f"{type(exc).__name__}: {exc}"
                             )
 
-                    print(f"Tool result: {tool_output}")
+                    else:
+                        tool_output = f"Error: Unknown function '{name}'."
 
+                    print(f"Result: {tool_output}")
+
+                    # Return the result to the model on the next round.
                     messages.append({
                         "role": "tool",
                         "tool_name": name,
